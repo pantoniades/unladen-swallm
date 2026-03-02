@@ -1,136 +1,133 @@
-"""Async wrapper around the `ollama` library.
+"""Async client wrapping openai.AsyncOpenAI for OpenAI-compatible endpoints.
 
-This module requires the `ollama` package and its `AsyncClient` API.
-It validates the client surface at startup and logs useful debug
-information when requested.
+Works with Ollama (/v1), vLLM, llama-swap, OpenAI, and any other provider
+that implements the OpenAI Chat Completions API.
 """
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 from typing import Any, Dict, List, Optional
 
-import ollama
-import asyncio
+from openai import AsyncOpenAI, APIStatusError
 from .models import Model
 
 logger = logging.getLogger(__name__)
 
 
-class OllamaClient:
-    """Simple Async wrapper around the documented `ollama.AsyncClient` API.
+def _normalize_base_url(host: str) -> str:
+    """Append /v1 if not already present."""
+    url = host.rstrip("/")
+    return url if url.endswith("/v1") else url + "/v1"
 
-    This simplified client assumes the `ollama` library exposes the
-    documented `AsyncClient` methods (for example `list`, `generate`,
-    `chat`). It no longer performs runtime discovery of method names.
-    Will default to 'localhost:11434' if no hostname/port is passed in.
+
+class OpenAICompatibleClient:
+    """Async client for any OpenAI-compatible LLM API.
+
+    Defaults to http://localhost:11434 (Ollama's OpenAI-compat endpoint).
+    Pass api_key="none" for local providers that don't require authentication.
     """
 
-    def __init__(self, host: Optional[str] = "localhost:11434"):
-        self.host = host
-        self._client = ollama.AsyncClient(host=self.host)
-        # Test the connection
-        try:
-            # Using sync client
-            response = ollama.Client(self.host).list()
-            logger.info(f"Connected to {self.host}")
-        except Exception as e:
-            logger.error(f"Connection failed for host {self.host}: {e}\n")
-            raise e
+    def __init__(self, host: str = "http://localhost:11434", api_key: str = "none"):
+        self._base_url = _normalize_base_url(host)
+        self._client = AsyncOpenAI(base_url=self._base_url, api_key=api_key)
+        self._use_stream_options = True  # auto-disabled on first 400/422
 
     async def close(self) -> None:
-        if self._client is None:
-            return
-        # Some implementations provide an async aclose(), others a sync close().
-        if hasattr(self._client, "aclose"):
-            await self._client.aclose()  # type: ignore[arg-type]
-        elif hasattr(self._client, "close"):
-            # close() may be sync or async; call and await only if awaitable.
-            res = self._client.close()
-            if inspect.isawaitable(res):
-                await res
+        await self._client.close()
 
     async def list_models(self) -> List[Model]:
-        """Return a list of `Model` objects available on the server.
+        """Return a list of Model objects available on the server."""
+        logger.debug("Fetching models from %s", self._base_url)
+        response = await self._client.models.list()
+        return [Model.from_openai(m) for m in response.data]
 
-        The ollama client may return several shapes:
-        - a list of dicts
-        - an async generator yielding parts (dict/list)
-        - an object with a `models` attribute (pydantic-like)
-        - an object with .dict() that returns one of the above
+    async def generate(self, model: str, prompt: str, **kwargs) -> Dict[str, Any]:
+        """Stream a chat completion and return timing + token metrics.
+
+        Returns a dict with:
+          content, elapsed, time_to_first_token, generation_time,
+          prompt_tokens, completion_tokens, tokens_per_sec,
+          elapsed_tokens_per_sec, token_counts_available
         """
-        logger.debug("Fetching models from ollama server")
-        raw = await self._client.list()
-        logger.debug("Raw models data: %s", raw)
+        messages = [{"role": "user", "content": prompt}]
 
-        items: List[Any] = []
+        async def _stream(include_usage: bool) -> Dict[str, Any]:
+            stream_kwargs: Dict[str, Any] = dict(
+                model=model,
+                messages=messages,
+                stream=True,
+                **kwargs,
+            )
+            if include_usage:
+                stream_kwargs["stream_options"] = {"include_usage": True}
 
-        def extend_from(obj: Any) -> None:
-            if obj is None:
-                return
-            # If obj is a mapping with 'models'
-            if isinstance(obj, dict) and "models" in obj:
-                models_part = obj.get("models") or []
-                if isinstance(models_part, list):
-                    items.extend(models_part)
-                else:
-                    items.append(models_part)
-                return
-            # If obj itself is a list, extend
-            if isinstance(obj, list):
-                items.extend(obj)
-                return
-            # If obj exposes a .models attribute (pydantic-like), try to use it
-            if hasattr(obj, "models"):
-                try:
-                    m = getattr(obj, "models")
-                    if m is None:
-                        return
-                    if isinstance(m, list):
-                        items.extend(m)
-                    else:
-                        items.append(m)
-                    return
-                except Exception:
-                    pass
-            # Fallback: append the object as-is
-            items.append(obj)
+            content_parts: List[str] = []
+            prompt_tokens: Optional[int] = None
+            completion_tokens: Optional[int] = None
+            time_to_first_token: Optional[float] = None
 
-        # If streaming async iterator
-        if inspect.isasyncgen(raw) or inspect.isgenerator(raw):
-            async for part in raw:  # type: ignore
-                # If part is a typed object with dict(), prefer its dict
-                if hasattr(part, "dict") and callable(getattr(part, "dict")):
-                    try:
-                        part = part.dict()
-                    except Exception:
-                        pass
-                extend_from(part)
+            start = asyncio.get_event_loop().time()
+            async with await self._client.chat.completions.create(**stream_kwargs) as stream:
+                async for chunk in stream:
+                    # Capture usage from the final chunk (stream_options)
+                    if chunk.usage is not None:
+                        prompt_tokens = chunk.usage.prompt_tokens
+                        completion_tokens = chunk.usage.completion_tokens
+
+                    if not chunk.choices:
+                        continue
+
+                    delta_content = chunk.choices[0].delta.content
+                    if delta_content is not None and delta_content != "":
+                        if time_to_first_token is None:
+                            time_to_first_token = asyncio.get_event_loop().time() - start
+                        content_parts.append(delta_content)
+
+            elapsed = asyncio.get_event_loop().time() - start
+            content = "".join(content_parts)
+
+            generation_time: Optional[float] = None
+            if time_to_first_token is not None:
+                generation_time = elapsed - time_to_first_token
+
+            token_counts_available = prompt_tokens is not None and completion_tokens is not None
+
+            tokens_per_sec: Optional[float] = None
+            elapsed_tokens_per_sec: Optional[float] = None
+            if token_counts_available and completion_tokens is not None:
+                if generation_time and generation_time > 0:
+                    tokens_per_sec = completion_tokens / generation_time
+                if elapsed > 0:
+                    elapsed_tokens_per_sec = completion_tokens / elapsed
+
+            return {
+                "content": content,
+                "elapsed": elapsed,
+                "time_to_first_token": time_to_first_token,
+                "generation_time": generation_time,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "tokens_per_sec": tokens_per_sec,
+                "elapsed_tokens_per_sec": elapsed_tokens_per_sec,
+                "token_counts_available": token_counts_available,
+            }
+
+        if self._use_stream_options:
+            try:
+                return await _stream(include_usage=True)
+            except APIStatusError as exc:
+                if exc.status_code in (400, 422):
+                    logger.debug(
+                        "stream_options not supported by server (%s %s); disabling",
+                        exc.status_code, exc.message,
+                    )
+                    self._use_stream_options = False
+                    result = await _stream(include_usage=False)
+                    result["token_counts_available"] = False
+                    return result
+                raise
         else:
-            # If the raw object has a .dict() method, try that first
-            if hasattr(raw, "dict") and callable(getattr(raw, "dict")):
-                try:
-                    raw_dict = raw.dict()
-                    extend_from(raw_dict)
-                except Exception:
-                    extend_from(raw)
-            else:
-                extend_from(raw)
-
-        # Normalize each item into a Model
-        models: List[Model] = [Model.from_dict(it) for it in items]
-        return models
-
-    async def generate(self, model: str, prompt: str, **kwargs) -> Any:
-        """Generate text from `model` using `prompt` and return raw response."""
-        logger.debug("Generating (model=%s) prompt_len=%d kwargs=%s", model, len(prompt), kwargs)
-        # Call the documented AsyncClient.generate() API. When stream=True the
-        # call may return an async iterable; in that case return the iterable
-        # so callers can iterate over streamed chunks.
-        resp = await self._client.generate(model=model, prompt=prompt, **kwargs)
-        logger.debug("Received generate response: %s", resp)
-        # If streaming, return the async generator as-is so caller can consume it.
-        if inspect.isasyncgen(resp) or inspect.isgenerator(resp):
-            return resp  # type: ignore[return-value]
-        return resp
+            result = await _stream(include_usage=False)
+            result["token_counts_available"] = False
+            return result

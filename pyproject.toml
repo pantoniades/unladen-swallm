@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "unladen-swallm"
 version = "0.1.0"
-description = "CLI tool for benchmarking Ollama LLM models"
+description = "CLI tool for benchmarking OpenAI-compatible LLM APIs"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -13,7 +13,7 @@ authors = [
     {name = "Philip"}
 ]
 dependencies = [
-    "ollama>=0.6.0",
+    "openai>=1.0.0",
     "click>=8.0.0",
     "rich>=14.0.0",
 ]
