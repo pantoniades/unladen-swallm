@@ -239,9 +239,10 @@ def generate(model: str, prompt: str, host: Optional[str], api_key: str) -> None
 @click.option("-r", "--response", "response", help="Whether to include full response in output", default=False, is_flag=True)
 @click.option("-f", "--format", "output_format", type=click.Choice(["json", "text"]), default="json", help="Output format (default: json)")
 @click.option("-o", "--output", "output_file", type=click.Path(), help="Write output to file instead of stdout")
+@click.option("--warmup/--no-warmup", default=True, help="Send a warmup request per model to trigger model loading before timed runs (default: on)")
 @click.option("--exclude-errors", is_flag=True, help="Exclude failed results from output")
 @click.option("--errors-only", is_flag=True, help="Only include failed results in output")
-def benchmark(prompt_text: Optional[str], prompts_file: Optional[str], concurrency: int, concurrency_mode: str, timeout: float, endpoint_delay: float, model: List[str], host: Optional[str], endpoint: tuple[str, ...], endpoint_key: tuple[str, ...], api_key: str, response: bool, output_format: str, output_file: Optional[str], exclude_errors: bool, errors_only: bool) -> None:
+def benchmark(prompt_text: Optional[str], prompts_file: Optional[str], concurrency: int, concurrency_mode: str, timeout: float, endpoint_delay: float, model: List[str], host: Optional[str], endpoint: tuple[str, ...], endpoint_key: tuple[str, ...], api_key: str, response: bool, output_format: str, output_file: Optional[str], warmup: bool, exclude_errors: bool, errors_only: bool) -> None:
     """Send prompts to models and report API stats plus timing.
 
     Supports single or multiple prompts and endpoints. Output in JSON (default) or text format.
@@ -297,6 +298,22 @@ def benchmark(prompt_text: Optional[str], prompts_file: Optional[str], concurren
 
                 # Shuffle order we test the models to avoid any systematic bias
                 shuffle(selected_models)
+
+                # Warmup: send a short throwaway request per model to trigger loading
+                if warmup:
+                    for m in selected_models:
+                        logger.info(f"[{ep.label}] Warming up {m.name}...")
+                        try:
+                            resp = await asyncio.wait_for(
+                                client.generate(m.name, "Hi"),
+                                timeout=timeout,
+                            )
+                            elapsed = resp.get("elapsed", 0)
+                            tps = resp.get("tokens_per_sec")
+                            tps_str = f", {tps:.1f} tok/s" if tps else ""
+                            logger.info(f"[{ep.label}] Warmup {m.name}: {elapsed:.1f}s{tps_str}")
+                        except Exception as exc:
+                            logger.warning(f"[{ep.label}] Warmup {m.name} failed: {exc}")
 
                 # Simple worker that calls generate and times it
                 async def run_for_model_and_prompt(m: Model, prompt: str) -> dict:

@@ -1,68 +1,44 @@
 # unladen-swallm
 
-Benchmark and evaluate [Ollama](https://ollama.ai/) LLM models. Compare performance, test multiple prompts, export results for quality evaluation.
+Benchmark OpenAI-compatible LLM APIs. Compare inference engines head-to-head: same model, same prompts, same GPU — which service is faster?
+
+Works with [Ollama](https://ollama.ai/), [llama-swap](https://github.com/mostlygeek/llama-swap), [vLLM](https://docs.vllm.ai/), [LM Studio](https://lmstudio.ai/), and any other service that implements `/v1/chat/completions`.
 
 ## Features
 
-- **JSON output** (default) - pipe results to (e.g.) Claude/GPT/Gemini for quality evaluation
-- **Multiple prompts** - test models across diverse inputs
-- **Performance metrics** - tokens/sec, latency, response time
-- **Concurrent requests** - async execution for volume benchmarking
-- **List models** - view available models with details
+- **Multi-endpoint comparison** — benchmark across services with a single command
+- **Summary statistics** — avg TTFT, avg tok/s, P50/P99 latency per endpoint+model
+- **Warmup** — automatically loads models before timed runs (skip cold-start noise)
+- **GPU memory management** — auto-unloads models between endpoints (Ollama, llama-swap)
+- **JSON output** — pipe results to Claude/GPT for quality evaluation
+- **Multiple prompts** — test models across diverse inputs
+- **Concurrent requests** — async execution for load testing
 
 ## Installation
 
 ```bash
 git clone https://github.com/pantoniades/unladen-swallm.git
 cd unladen-swallm
-python3 -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-
-# Verify venv is activated (should see (.venv) in prompt)
-pip install --upgrade pip
 pip install -e .
-
-# Verify installation
-python verify_install.py
-```
-
-**Note:**
-- Requires pip 21.3+ for pyproject.toml support
-- **IMPORTANT:** Always activate the venv before running commands
-- If you get "module not found" errors, your venv is not activated
-- Run `python verify_install.py` anytime to check your setup
-
-**If `swallm` command not found after install:**
-```bash
-# Option 1: Use python -m instead
-python -m unladen_swallm benchmark
-
-# Option 2: Check if venv is activated (should see (.venv) in prompt)
-source .venv/bin/activate  # or deactivate and reactivate
-
-# Option 3: Use full path
-.venv/bin/swallm benchmark
-```
-
-## Prerequisites
-
-Ensure [Ollama](https://ollama.ai/) is running:
-
-```bash
-ollama serve
 ```
 
 ## Quick Start
 
 ```bash
-# Benchmark all models (outputs JSON)
-swallm benchmark
-# Or if command not found: python -m unladen_swallm benchmark
+# Benchmark a model on the default endpoint (localhost:11434)
+swallm benchmark -m qwen3.5:27b -f text
 
-# Benchmark specific models with multiple prompts
-swallm benchmark -P prompts.txt -m llama2 -m mistral -r -o results.json
+# Compare two inference engines
+swallm benchmark \
+  --endpoint ollama=http://localhost:11434 \
+  --endpoint llama-swap=http://localhost:11500 \
+  -m qwen3.5:27b -m qwen3.5-27b \
+  -P prompts.txt -f text
 
-# Then evaluate with Claude
+# Save JSON results for analysis
+swallm benchmark -m gemma3:12b -P prompts.txt -r -o results.json
+
+# Evaluate quality with Claude
 claude "Rate these LLM responses: $(cat results.json)"
 ```
 
@@ -72,184 +48,162 @@ claude "Rate these LLM responses: $(cat results.json)"
 
 ```bash
 # Basic usage
-swallm benchmark                    # All models, default prompt, JSON output
-swallm benchmark -m llama2          # Specific model
-swallm benchmark --prompt "..."     # Custom prompt
-swallm benchmark -P prompts.txt     # Multiple prompts from file
+swallm benchmark                        # All models, default prompt, JSON
+swallm benchmark -m llama3.1:8b         # Specific model
+swallm benchmark --prompt "..."         # Custom prompt
+swallm benchmark -P prompts.txt         # Multiple prompts from file
+
+# Multi-endpoint comparison
+swallm benchmark \
+  -E ollama=http://localhost:11434 \
+  -E vllm=http://localhost:8000 \
+  -m qwen3.5:27b
+
+# Per-endpoint API keys (for cloud services)
+swallm benchmark \
+  -E local=http://localhost:11434 \
+  -E cloud=https://api.openai.com \
+  --endpoint-key cloud=sk-abc123 \
+  -m gpt-4o-mini
 
 # Output control
-swallm benchmark -o results.json    # Save to file
-swallm benchmark -f text            # Text format instead of JSON
-swallm benchmark -r                 # Include full response text (defualts to results only)
+swallm benchmark -o results.json       # Save to file
+swallm benchmark -f text               # Text format with summary table
+swallm benchmark -r                    # Include full response text
 
 # Performance
-swallm benchmark -c 3               # Run 3 requests concurrently
-swallm benchmark -t 60              # 60 second timeout
-
-# Combined example
-swallm benchmark -P prompts.txt -m llama2 -m mistral -r -o results.json -c 2
+swallm benchmark -c 3                  # 3 concurrent requests
+swallm benchmark -t 180                # 180 second timeout
+swallm benchmark --no-warmup           # Skip warmup requests
 ```
 
 **Options:**
-- `--prompt TEXT` - Single prompt text
-- `-P, --prompts-file PATH` - File with prompts (single-line or triple-quote `"""` multi-line)
-- `-m, --model TEXT` - Specific model(s) to test (repeatable)
-- `-c, --concurrent INT` - Concurrent requests (default: 1)
-- `--concurrency-mode [global|per-model]` - How concurrency works (default: per-model)
-  - `per-model`: Run N prompts concurrently for each model (tests model's concurrent handling)
-  - `global`: Run N total tasks concurrently across all models
-- `-t, --timeout FLOAT` - Timeout in seconds (default: 30)
-- `-f, --format [json|text]` - Output format (default: json)
-- `-o, --output PATH` - Write to file instead of stdout
-- `-r, --response` - Include full response text
-- `--exclude-errors` - Don't write failed results to output
-- `--errors-only` - Only write failed results (useful for debugging)
-- `-H, --host TEXT` - Ollama server URL (or set `OLLAMA_HOST`)
 
-### list-models (more info & formatting than `ollama list`)
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--prompt TEXT` | Single prompt text | built-in default |
+| `-P, --prompts-file PATH` | File with prompts (single-line or `"""` multi-line) | |
+| `-m, --model TEXT` | Model(s) to test (repeatable) | all available |
+| `-E, --endpoint TEXT` | Endpoint as `label=url` (repeatable) | `--host` value |
+| `--endpoint-key TEXT` | Per-endpoint API key as `label=key` (repeatable) | `--api-key` value |
+| `-H, --host TEXT` | LLM API host URL (env: `LLM_HOST`) | `http://localhost:11434` |
+| `--api-key TEXT` | API key (env: `OPENAI_API_KEY`) | `none` |
+| `-c, --concurrent INT` | Concurrent requests | `1` |
+| `--concurrency-mode` | `global` or `per-model` | `per-model` |
+| `-t, --timeout FLOAT` | Per-request timeout in seconds | `120` |
+| `--endpoint-delay FLOAT` | Seconds between endpoints for GPU cooldown | `5` |
+| `--warmup / --no-warmup` | Warmup request per model before timed runs | `--warmup` |
+| `-f, --format` | `json` or `text` | `json` |
+| `-o, --output PATH` | Write to file instead of stdout | |
+| `-r, --response` | Include full response text | off |
+| `--exclude-errors` | Omit failed results from output | |
+| `--errors-only` | Only show failed results | |
+
+### list-models
 
 ```bash
-swallm list-models              # Pretty format
-swallm list-models -f compact   # One line per model
-swallm list-models -n           # No color
+swallm list-models                     # Pretty format
+swallm list-models -f compact          # One line per model
+swallm list-models -n                  # No color
+swallm list-models -H http://host:8000 # Different server
 ```
-
-**Options:**
-- `-f, --print-format [pretty|compact]` - Output format (default: pretty)
-- `-n, --no-color` - Disable colored output
-- `-H, --host TEXT` - Ollama server URL
 
 ### generate
 
 ```bash
-swallm generate llama2 "Explain quantum computing"
+swallm generate llama3.1:8b "Explain quantum computing"
 ```
 
 ## JSON Output Format
 
-**Success:**
 ```json
 {
   "config": {
+    "endpoints": [{"label": "ollama", "url": "http://localhost:11434"}],
     "prompts": ["What is 2+2?"],
-    "models": ["llama2"],
+    "models": ["llama3.1:8b"],
     "concurrency": 1,
     "concurrency_mode": "per-model",
-    "timeout": 30.0
+    "timeout": 120.0
   },
   "results": [
     {
-      "model": "llama2",
+      "endpoint": "ollama",
+      "model": "llama3.1:8b",
       "prompt": "What is 2+2?",
       "status": "ok",
       "elapsed": 1.234,
       "metrics": {
-        "prompt_eval_count": 10,
-        "eval_count": 25,
-        "prompt_tokens_per_sec": 123.45,
-        "response_tokens_per_sec": 67.89
-      },
-      "response": "The answer is 4."
+        "elapsed": 1.234,
+        "time_to_first_token": 0.089,
+        "generation_time": 1.145,
+        "prompt_tokens": 10,
+        "completion_tokens": 25,
+        "tokens_per_sec": 21.83,
+        "elapsed_tokens_per_sec": 20.26,
+        "token_counts_available": true
+      }
+    }
+  ],
+  "summary": [
+    {
+      "endpoint": "ollama",
+      "model": "llama3.1:8b",
+      "avg_ttft": 0.089,
+      "avg_tps": 21.83,
+      "p50_elapsed": 1.234,
+      "p99_elapsed": 1.234,
+      "requests": 1,
+      "errors": 0
     }
   ]
 }
 ```
 
-**Error:**
-```json
-{
-  "model": "broken-model",
-  "prompt": "What is 2+2?",
-  "status": "error",
-  "elapsed": 0.123,
-  "error": {
-    "type": "ConnectionError",
-    "message": "Connection refused",
-    "model": "broken-model",
-    "prompt": "What is 2+2?"
-  }
-}
+## Text Output
+
+With `-f text`, results include a summary table:
+
 ```
+Summary
+┏━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━┓
+┃ Endpoint   ┃ Model       ┃ Avg TTFT ┃ Avg tok/s ┃ P50 Latency ┃ P99 Latency ┃ Requests ┃ Errors ┃
+┡━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━┩
+│ ollama     │ qwen3.5:27b │   0.085s │      16.1 │      3.210s │      3.210s │        5 │      0 │
+│ llama-swap │ qwen3.5-27b │   0.042s │      38.8 │      1.340s │      1.340s │        5 │      0 │
+└────────────┴─────────────┴──────────┴───────────┴─────────────┴─────────────┴──────────┴────────┘
+```
+
+The Endpoint column is hidden when using a single endpoint.
 
 ## Configuration
 
 ### Environment Variables
 
-- `OLLAMA_HOST` - Server URL (default: http://localhost:11434)
-- `NO_COLOR` - Disable colored output
+- `LLM_HOST` — Default server URL (default: `http://localhost:11434`)
+- `OPENAI_API_KEY` — Default API key (default: `none`)
+- `NO_COLOR` — Disable colored output
 
 ### Global Options
 
-- `-v, --verbose` - Enable debug logging (must come before subcommand)
+`-v, --verbose` must come **before** the subcommand:
 
 ```bash
-swallm -v benchmark -m llama2  # ✅ Correct
-swallm benchmark -v -m llama2  # ❌ Wrong
+swallm -v benchmark -m llama3.1:8b    # correct
 ```
 
 ## Development
 
 ```bash
-# Install with dev dependencies
 pip install -e ".[dev]"
-
-# Run tests
 pytest -v
-```
-
-## Example Workflow
-
-```bash
-# Create prompts file (supports single-line and triple-quote multi-line)
-cat > prompts.txt << 'EOF'
-What is 2+2?
-
-"""
-Explain quantum computing.
-Include both theory and
-practical applications.
-"""
-
-Write a haiku about programming.
-What is the capital of France?
-EOF
-
-# Benchmark models with full responses (per-model concurrency)
-swallm benchmark -P prompts.txt -m llama2 -m mistral -r -c 3 -o results.json
-
-# Test concurrent load handling: run 3 prompts at once per model
-swallm benchmark -P prompts.txt -c 3 --concurrency-mode per-model
-
-# Only save successful results
-swallm benchmark -P prompts.txt --exclude-errors -o results.json
-
-# Debug: only show errors
-swallm benchmark -P prompts.txt --errors-only -f text
-
-# Evaluate quality with Claude
-claude "Review these LLM benchmark results and rate each response for accuracy and quality: $(cat results.json)"
 ```
 
 ## Requirements
 
 - Python 3.10+
-- Ollama server
-- Dependencies: `ollama`, `click`, `rich` (auto-installed)
-
-## Troubleshooting
-
-**"click not found" or "module not found":**
-```bash
-# Your venv is not activated. Activate it:
-source .venv/bin/activate  # You should see (.venv) in prompt
-
-# Verify it worked:
-python -c "import click; print('Dependencies loaded')"
-```
-
-**Command not found:** Use `python -m unladen_swallm` instead of `swallm`, or ensure venv is activated
-
-**Connection refused:** Ensure Ollama is running (`ollama serve`)
+- An OpenAI-compatible LLM server (Ollama, llama-swap, vLLM, etc.)
+- Dependencies: `openai`, `click`, `rich`, `httpx` (auto-installed)
 
 ## License
 

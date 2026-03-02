@@ -322,3 +322,136 @@ def test_benchmark_endpoint_key(monkeypatch):
     ])
     assert result.exit_code == 0, result.output
     assert keys_seen == ["fallback", "sk-secret"]
+
+
+# ---------------------------------------------------------------------------
+# Warmup
+# ---------------------------------------------------------------------------
+
+def test_benchmark_warmup_sends_extra_request(monkeypatch):
+    """With warmup on (default), each model gets an extra generate call before timed runs."""
+    from unladen_swallm.models import Model
+    from unladen_swallm.cli import cli
+
+    generate_calls = []
+
+    class FakeClient:
+        def __init__(self, host=None, api_key="none"):
+            self._base_url = host + "/v1" if host else "http://localhost:11434/v1"
+
+        async def list_models(self):
+            return [Model(name="m1"), Model(name="m2")]
+
+        async def generate(self, model, prompt):
+            generate_calls.append((model, prompt))
+            return {
+                "content": "ok", "elapsed": 1.0, "time_to_first_token": 0.1,
+                "generation_time": 0.9, "prompt_tokens": 5, "completion_tokens": 10,
+                "tokens_per_sec": 11.0, "elapsed_tokens_per_sec": 10.0,
+                "token_counts_available": True,
+            }
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("unladen_swallm.cli.OpenAICompatibleClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, [
+        "benchmark", "-m", "m1", "-m", "m2", "--prompt", "test", "-f", "json",
+    ])
+    assert result.exit_code == 0, result.output
+
+    # 2 warmup calls ("Hi") + 2 benchmark calls ("test") = 4 total
+    assert len(generate_calls) == 4
+    warmup_calls = [(m, p) for m, p in generate_calls if p == "Hi"]
+    bench_calls = [(m, p) for m, p in generate_calls if p == "test"]
+    assert len(warmup_calls) == 2
+    assert len(bench_calls) == 2
+
+    # Warmup results should NOT appear in output
+    data = json.loads(result.output)
+    assert len(data["results"]) == 2
+    for r in data["results"]:
+        assert r["prompt"] == "test"
+
+
+def test_benchmark_no_warmup_flag(monkeypatch):
+    """--no-warmup should skip the warmup request."""
+    from unladen_swallm.models import Model
+    from unladen_swallm.cli import cli
+
+    generate_calls = []
+
+    class FakeClient:
+        def __init__(self, host=None, api_key="none"):
+            self._base_url = host + "/v1" if host else "http://localhost:11434/v1"
+
+        async def list_models(self):
+            return [Model(name="m1")]
+
+        async def generate(self, model, prompt):
+            generate_calls.append((model, prompt))
+            return {
+                "content": "ok", "elapsed": 1.0, "time_to_first_token": 0.1,
+                "generation_time": 0.9, "prompt_tokens": 5, "completion_tokens": 10,
+                "tokens_per_sec": 11.0, "elapsed_tokens_per_sec": 10.0,
+                "token_counts_available": True,
+            }
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("unladen_swallm.cli.OpenAICompatibleClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, [
+        "benchmark", "-m", "m1", "--prompt", "test", "--no-warmup", "-f", "json",
+    ])
+    assert result.exit_code == 0, result.output
+
+    # Only 1 benchmark call, no warmup
+    assert len(generate_calls) == 1
+    assert generate_calls[0] == ("m1", "test")
+
+
+def test_benchmark_warmup_failure_continues(monkeypatch):
+    """If warmup fails, benchmark should still proceed."""
+    from unladen_swallm.models import Model
+    from unladen_swallm.cli import cli
+
+    call_count = 0
+
+    class FakeClient:
+        def __init__(self, host=None, api_key="none"):
+            self._base_url = host + "/v1" if host else "http://localhost:11434/v1"
+
+        async def list_models(self):
+            return [Model(name="m1")]
+
+        async def generate(self, model, prompt):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Warmup fails
+                raise ConnectionError("server not ready")
+            return {
+                "content": "ok", "elapsed": 1.0, "time_to_first_token": 0.1,
+                "generation_time": 0.9, "prompt_tokens": 5, "completion_tokens": 10,
+                "tokens_per_sec": 11.0, "elapsed_tokens_per_sec": 10.0,
+                "token_counts_available": True,
+            }
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("unladen_swallm.cli.OpenAICompatibleClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, [
+        "benchmark", "-m", "m1", "--prompt", "test", "-f", "json",
+    ])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert len(data["results"]) == 1
+    assert data["results"][0]["status"] == "ok"
